@@ -46,8 +46,8 @@ class Grid:
     width: int
     height: int
     solid: np.ndarray
-    obstacle_center: tuple[float, float]
-    obstacle_radius: float
+    round_obstacles: tuple[tuple[float, float, float], ...]
+    rect_obstacles: tuple[tuple[int, int, int, int], ...]
 
     @property
     def n_cells(self) -> int:
@@ -69,6 +69,7 @@ class Weights:
     diagonal_streamline: float = 0.04
     obstacle_deflect: float = 0.9
     obstacle_tangent: float = 1.8
+    rect_deflect: float = 1.5
 
 
 def cell_index(x: int, y: int, width: int) -> int:
@@ -86,12 +87,15 @@ def velocity_categories(max_speed: int) -> tuple[np.ndarray, dict[tuple[int, int
     return cats, index
 
 
-def make_pipe_with_boulder(width: int, height: int, radius: float) -> Grid:
+def pipe_walls(width: int, height: int) -> np.ndarray:
     solid = np.zeros((height, width), dtype=bool)
-
-    # Pipe walls.
     solid[0, :] = True
     solid[-1, :] = True
+    return solid
+
+
+def make_pipe_with_boulder(width: int, height: int, radius: float) -> Grid:
+    solid = pipe_walls(width, height)
 
     # A circular obstacle near the center.
     cx = (width - 1) / 2.0
@@ -105,9 +109,69 @@ def make_pipe_with_boulder(width: int, height: int, radius: float) -> Grid:
         width=width,
         height=height,
         solid=solid,
-        obstacle_center=(cx, cy),
-        obstacle_radius=radius,
+        round_obstacles=((cx, cy, radius),),
+        rect_obstacles=(),
     )
+
+
+def make_pipe_with_twin_boulders(width: int, height: int, radius: float) -> Grid:
+    solid = pipe_walls(width, height)
+    obstacles = (
+        (width * 0.38, height * 0.35, radius),
+        (width * 0.62, height * 0.65, radius),
+    )
+
+    for cx, cy, obstacle_radius in obstacles:
+        for y in range(height):
+            for x in range(width):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= obstacle_radius**2:
+                    solid[y, x] = True
+
+    return Grid(
+        width=width,
+        height=height,
+        solid=solid,
+        round_obstacles=obstacles,
+        rect_obstacles=(),
+    )
+
+
+def make_pipe_with_alternating_fins(width: int, height: int) -> Grid:
+    solid = pipe_walls(width, height)
+    fin_length = max(3, int(round(height * 0.34)))
+    fin_width = 2
+    start_x = max(4, width // 5)
+    spacing = max(5, width // 5)
+
+    rects: list[tuple[int, int, int, int]] = []
+    for i, x0 in enumerate(range(start_x, width - 3, spacing)):
+        x1 = min(width - 1, x0 + fin_width)
+        if i % 2 == 0:
+            y0 = height - fin_length - 1
+            y1 = height - 1
+        else:
+            y0 = 1
+            y1 = fin_length + 1
+        solid[y0:y1, x0:x1] = True
+        rects.append((x0, x1, y0, y1))
+
+    return Grid(
+        width=width,
+        height=height,
+        solid=solid,
+        round_obstacles=(),
+        rect_obstacles=tuple(rects),
+    )
+
+
+def make_grid(geometry: str, width: int, height: int, radius: float) -> Grid:
+    if geometry == "boulder":
+        return make_pipe_with_boulder(width, height, radius)
+    if geometry == "fins":
+        return make_pipe_with_alternating_fins(width, height)
+    if geometry == "twin-boulders":
+        return make_pipe_with_twin_boulders(width, height, radius)
+    raise ValueError(f"unknown geometry: {geometry}")
 
 
 def target_penalty(cats: np.ndarray, target: tuple[int, int], scale: float) -> np.ndarray:
@@ -174,26 +238,41 @@ def build_unary_energy(
                     target = (max(1, inflow - 1), sign * max(1, inflow - 1))
                     energy[idx, :] += target_penalty(cats, target, weights.obstacle_deflect)
 
-            # Boundary-layer surrogate around the boulder. In an inviscid model
-            # the obstacle does not create viscosity, but it should still split
-            # streamlines around the blocked region and then bend them back.
-            cx, cy = grid.obstacle_center
-            dx = x - cx
-            dy = y - cy
-            distance = float(np.hypot(dx, dy))
-            shell_width = 3.0
-            in_obstacle_shell = grid.obstacle_radius < distance <= grid.obstacle_radius + shell_width
-            if in_obstacle_shell and abs(dy) > 0.2:
-                if dx <= 0:
-                    vertical_sign = 1 if dy > 0 else -1
-                else:
-                    vertical_sign = -1 if dy > 0 else 1
+            # Boundary-layer surrogate around round obstacles. In an inviscid
+            # model the obstacle does not create viscosity, but it should still
+            # split streamlines around blocked regions and bend them back.
+            for cx, cy, radius in grid.round_obstacles:
+                dx = x - cx
+                dy = y - cy
+                distance = float(np.hypot(dx, dy))
+                shell_width = 3.0
+                in_obstacle_shell = radius < distance <= radius + shell_width
+                if in_obstacle_shell and abs(dy) > 0.2:
+                    if dx <= 0:
+                        vertical_sign = 1 if dy > 0 else -1
+                    else:
+                        vertical_sign = -1 if dy > 0 else 1
 
-                # Strongest near the solid boundary, weaker at the outer shell.
-                closeness = (grid.obstacle_radius + shell_width - distance) / shell_width
-                tangent_weight = weights.obstacle_tangent * max(0.0, closeness)
-                target = (max(1, inflow), vertical_sign * max(1, inflow))
-                energy[idx, :] += target_penalty(cats, target, tangent_weight)
+                    # Strongest near the solid boundary, weaker at the outer shell.
+                    closeness = (radius + shell_width - distance) / shell_width
+                    tangent_weight = weights.obstacle_tangent * max(0.0, closeness)
+                    target = (max(1, inflow), vertical_sign * max(1, inflow))
+                    energy[idx, :] += target_penalty(cats, target, tangent_weight)
+
+            # Rectangular fin surrogate: cells close to a protruding solid fin
+            # are biased away from the fin and toward the open lane.
+            for x0, x1, y0, y1 in grid.rect_obstacles:
+                closest_x = min(max(x, x0), x1 - 1)
+                closest_y = min(max(y, y0), y1 - 1)
+                distance = float(np.hypot(x - closest_x, y - closest_y))
+                shell_width = 3.0
+                if 0.0 < distance <= shell_width:
+                    cy = (y0 + y1 - 1) / 2.0
+                    vertical_sign = 1 if y > cy else -1
+                    closeness = (shell_width - distance) / shell_width
+                    deflect_weight = weights.rect_deflect * max(0.0, closeness)
+                    target = (max(1, inflow), vertical_sign * max(1, inflow))
+                    energy[idx, :] += target_penalty(cats, target, deflect_weight)
 
     return energy
 
@@ -346,7 +425,7 @@ def score_assignment(
 
 
 def sample_flow(args: argparse.Namespace):
-    grid = make_pipe_with_boulder(args.width, args.height, args.obstacle_radius)
+    grid = make_grid(args.geometry, args.width, args.height, args.obstacle_radius)
     cats, cat_index = velocity_categories(args.max_speed)
     weights = Weights()
     betas = beta_schedule(args.beta_start, args.beta_end, args.anneal_stages)
@@ -380,7 +459,14 @@ def sample_flow(args: argparse.Namespace):
     return grid, cats, best_assignment, best_score
 
 
-def plot_flow(grid: Grid, cats: np.ndarray, assignment: np.ndarray, energy: float, out_path: Path) -> None:
+def plot_flow(
+    grid: Grid,
+    cats: np.ndarray,
+    assignment: np.ndarray,
+    energy: float,
+    geometry: str,
+    out_path: Path,
+) -> None:
     field = cats[assignment].reshape(grid.height, grid.width, 2).astype(float)
     u = field[:, :, 0]
     v = field[:, :, 1]
@@ -396,7 +482,8 @@ def plot_flow(grid: Grid, cats: np.ndarray, assignment: np.ndarray, energy: floa
     ax.imshow(np.where(mask, 1.0, np.nan), origin="lower", cmap="gray_r", alpha=0.95)
     ax.quiver(x, y, u_plot, v_plot, color="black", pivot="middle", scale=55, width=0.003)
 
-    ax.set_title(f"THRML sampled toy inviscid pipe flow, energy={energy:.2f}")
+    title_geometry = geometry.replace("-", " ")
+    ax.set_title(f"THRML sampled toy inviscid pipe flow: {title_geometry}, energy={energy:.2f}")
     ax.set_aspect("equal")
     ax.set_xlim(-0.5, grid.width - 0.5)
     ax.set_ylim(-0.5, grid.height - 0.5)
@@ -412,6 +499,12 @@ def plot_flow(grid: Grid, cats: np.ndarray, assignment: np.ndarray, energy: floa
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sample a toy 2D flow field with THRML.")
+    parser.add_argument(
+        "--geometry",
+        choices=("boulder", "fins", "twin-boulders"),
+        default="boulder",
+        help="pipe obstacle layout to sample",
+    )
     parser.add_argument("--width", type=int, default=22)
     parser.add_argument("--height", type=int, default=11)
     parser.add_argument("--obstacle-radius", type=float, default=2.2)
@@ -435,7 +528,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     grid, cats, assignment, energy = sample_flow(args)
-    plot_flow(grid, cats, assignment, energy, args.output)
+    plot_flow(grid, cats, assignment, energy, args.geometry, args.output)
     print(f"wrote {args.output}")
     return 0
 

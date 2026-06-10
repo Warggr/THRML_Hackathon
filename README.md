@@ -28,7 +28,9 @@ The energy contains:
 - a local obstacle-deflection term that biases right-moving flow into open
   diagonal lanes when a boulder is directly ahead,
 - an obstacle-shell tangent-flow prior that splits streamlines around the
-  boulder and bends them back afterward.
+  boulder and bends them back afterward,
+- a rectangular-fin deflection term that pushes flow away from top/bottom
+  protrusions.
 
 THRML samples from:
 
@@ -53,6 +55,37 @@ The output image is written to:
 
 ```text
 fluid_flow_thrml/outputs/flow.png
+```
+
+## Examples
+
+Single boulder:
+
+```bash
+python fluid_flow_thrml/fluid_sampler.py \
+  --geometry boulder \
+  --output fluid_flow_thrml/outputs/flow.png
+```
+
+Alternating fins protruding from the top and bottom walls:
+
+```bash
+python fluid_flow_thrml/fluid_sampler.py \
+  --geometry fins \
+  --width 28 \
+  --height 13 \
+  --output fluid_flow_thrml/outputs/flow_fins.png
+```
+
+Two offset boulders:
+
+```bash
+python fluid_flow_thrml/fluid_sampler.py \
+  --geometry twin-boulders \
+  --width 28 \
+  --height 13 \
+  --obstacle-radius 1.9 \
+  --output fluid_flow_thrml/outputs/flow_twin_boulders.png
 ```
 
 Try a longer run:
